@@ -31,7 +31,13 @@ func setupBatchTest(t *testing.T) (*BatchClient, redis.UniversalClient) {
 	config := DefaultBatchTaskConfig()
 	config.BatchTTL = 1 * time.Hour // 测试时使用较短的TTL
 
-	client := NewBatchClientFromRedisClient(redisClient, config)
+	// 创建测试用的handler
+	handler := HandlerFunc(func(ctx context.Context, task *Task) error {
+		// 模拟任务处理
+		return nil
+	})
+
+	client := NewBatchClientFromRedisClient(redisClient, config, handler)
 
 	return client, redisClient
 }

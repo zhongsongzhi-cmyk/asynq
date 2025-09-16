@@ -23,7 +23,7 @@ type BatchClient struct {
 }
 
 // NewBatchClient 创建新的批量任务客户端
-func NewBatchClient(r RedisConnOpt, config *BatchTaskConfig) *BatchClient {
+func NewBatchClient(r RedisConnOpt, config *BatchTaskConfig, handler Handler) *BatchClient {
 	client := NewClient(r)
 
 	redisClient, ok := r.MakeRedisClient().(redis.UniversalClient)
@@ -40,6 +40,7 @@ func NewBatchClient(r RedisConnOpt, config *BatchTaskConfig) *BatchClient {
 		redisClient,
 		log.NewLogger(nil),
 		config,
+		handler,
 	)
 
 	return &BatchClient{
@@ -51,7 +52,7 @@ func NewBatchClient(r RedisConnOpt, config *BatchTaskConfig) *BatchClient {
 }
 
 // NewBatchClientFromRedisClient 从Redis客户端创建批量任务客户端
-func NewBatchClientFromRedisClient(c redis.UniversalClient, config *BatchTaskConfig) *BatchClient {
+func NewBatchClientFromRedisClient(c redis.UniversalClient, config *BatchTaskConfig, handler Handler) *BatchClient {
 	client := NewClientFromRedisClient(c)
 
 	if config == nil {
@@ -63,6 +64,7 @@ func NewBatchClientFromRedisClient(c redis.UniversalClient, config *BatchTaskCon
 		c,
 		log.NewLogger(nil),
 		config,
+		handler,
 	)
 
 	return &BatchClient{

@@ -88,10 +88,11 @@ type TaskExecutionResult struct {
 
 // BatchTaskManager 批量任务管理器
 type BatchTaskManager struct {
-	broker base.Broker
-	logger *log.Logger
-	config *BatchTaskConfig
-	redis  redis.UniversalClient
+	broker  base.Broker
+	logger  *log.Logger
+	config  *BatchTaskConfig
+	redis   redis.UniversalClient
+	handler Handler // 新增：任务处理器
 
 	// 运行时状态
 	timers     map[string]*time.Timer
@@ -117,7 +118,7 @@ type BatchMetrics struct {
 }
 
 // NewBatchTaskManager 创建新的批量任务管理器
-func NewBatchTaskManager(broker base.Broker, redis redis.UniversalClient, logger *log.Logger, config *BatchTaskConfig) *BatchTaskManager {
+func NewBatchTaskManager(broker base.Broker, redis redis.UniversalClient, logger *log.Logger, config *BatchTaskConfig, handler Handler) *BatchTaskManager {
 	if config == nil {
 		config = DefaultBatchTaskConfig()
 	}
@@ -131,6 +132,7 @@ func NewBatchTaskManager(broker base.Broker, redis redis.UniversalClient, logger
 		redis:      redis,
 		logger:     logger,
 		config:     config,
+		handler:    handler,
 		timers:     make(map[string]*time.Timer),
 		executions: make(map[string]*BatchTaskExecution),
 		done:       make(chan struct{}),
@@ -385,34 +387,47 @@ func (btm *BatchTaskManager) executeTask(task *Task, batch *BatchTask, taskIndex
 
 	startTime := time.Now()
 
-	// 创建任务消息
-	msg := &base.TaskMessage{
-		ID:      result.TaskID,
-		Type:    task.Type(),
-		Payload: task.Payload(),
-		Queue:   batch.Queue,
-		Retry:   0, // 批量任务不重试，由批量管理器处理
-	}
+	// 直接调用handler执行任务，而不是放入队列
+	if btm.handler != nil {
+		ctx := context.Background()
 
-	// 合并任务选项
-	for _, opt := range task.opts {
-		switch opt := opt.(type) {
-		case retryOption:
-			msg.Retry = int(opt)
-		case timeoutOption:
-			msg.Timeout = int64(time.Duration(opt).Seconds())
-		case deadlineOption:
-			msg.Deadline = time.Time(opt).Unix()
+		// 设置任务超时
+		if task.opts != nil {
+			for _, opt := range task.opts {
+				if timeoutOpt, ok := opt.(timeoutOption); ok {
+					timeout := time.Duration(timeoutOpt)
+					if timeout > 0 {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithTimeout(ctx, timeout)
+						defer cancel()
+					}
+				} else if deadlineOpt, ok := opt.(deadlineOption); ok {
+					deadline := time.Time(deadlineOpt)
+					if !deadline.IsZero() {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithDeadline(ctx, deadline)
+						defer cancel()
+					}
+				}
+			}
 		}
-	}
 
-	// 直接入队到 pending 状态
-	err := btm.broker.Enqueue(context.Background(), msg)
-	if err != nil {
+		// 创建Asynq任务对象
+		asynqTask := NewTask(task.Type(), task.Payload())
+
+		// 直接调用handler处理任务
+		err := btm.handler.ProcessTask(ctx, asynqTask)
+		if err != nil {
+			result.Status = "failed"
+			result.Error = err.Error()
+			btm.logger.Errorf("Batch task %s failed: %v", result.TaskID, err)
+		} else {
+			btm.logger.Debugf("Batch task %s completed successfully", result.TaskID)
+		}
+	} else {
 		result.Status = "failed"
-		result.Error = fmt.Sprintf("failed to enqueue task: %v", err)
-		result.Duration = time.Since(startTime)
-		return result
+		result.Error = "no handler registered for batch task execution"
+		btm.logger.Errorf("No handler registered for batch task %s", result.TaskID)
 	}
 
 	result.Duration = time.Since(startTime)
