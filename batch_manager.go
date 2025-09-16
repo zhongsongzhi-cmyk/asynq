@@ -184,7 +184,7 @@ func (btm *BatchTaskManager) ScheduleBatch(ctx context.Context, tasks []*Task, i
 
 	// 如果开始时间过早，需要自动调整
 	// 确保有足够的时间来准备和调度所有任务
-	minStartTime := now.Add(200 * time.Millisecond) // 至少200ms的准备时间
+	minStartTime := now.Add(800 * time.Millisecond) // 至少200ms的准备时间
 	if firstTaskTime.Before(minStartTime) {
 		btm.logger.Warnf("Start time %v is too early, adjusting to %v",
 			firstTaskTime.Format("15:04:05.000"), minStartTime.Format("15:04:05.000"))
