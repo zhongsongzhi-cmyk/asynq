@@ -238,7 +238,7 @@ func (btm *BatchTaskManager) generateBatchID() string {
 	return fmt.Sprintf("batch_%d_%d", time.Now().UnixNano(), time.Now().Nanosecond()%1000)
 }
 
-// executeBatch 执行批量任务
+// executeBatch 执行批量任务（并发版本）
 func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 	btm.wg.Add(1)
 	defer btm.wg.Done()
@@ -250,11 +250,10 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 
 	// 创建执行状态
 	execution := &BatchTaskExecution{
-		BatchID:      batch.ID,
-		CurrentIndex: 0,
-		StartTime:    time.Now(),
-		TaskResults:  make([]TaskExecutionResult, len(batch.Tasks)),
-		TimeErrors:   make([]time.Duration, 0, len(batch.Tasks)),
+		BatchID:     batch.ID,
+		StartTime:   time.Now(),
+		TaskResults: make([]TaskExecutionResult, len(batch.Tasks)),
+		TimeErrors:  make([]time.Duration, len(batch.Tasks)),
 	}
 
 	btm.mu.Lock()
@@ -266,87 +265,141 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 	batch.UpdatedAt = time.Now().UnixNano()
 	btm.updateBatchStatus(context.Background(), batch)
 
-	btm.logger.Infof("Starting execution of batch %s with %d tasks", batch.ID, len(batch.Tasks))
+	btm.logger.Infof("Starting concurrent execution of batch %s with %d tasks", batch.ID, len(batch.Tasks))
 
 	startTime := time.Unix(0, batch.StartTime)
 	interval := time.Duration(batch.Interval)
+
+	// 创建结果收集通道和同步机制
+	resultChan := make(chan TaskExecutionResult, len(batch.Tasks))
+	var taskWg sync.WaitGroup
+	taskWg.Add(len(batch.Tasks))
+
+	// 为每个任务创建独立的goroutine和定时器
+	for i, task := range batch.Tasks {
+		go func(taskIndex int, taskToExecute *Task) {
+			defer taskWg.Done()
+
+			// 检查是否应该停止
+			select {
+			case <-btm.done:
+				btm.logger.Infof("Task %d in batch %s cancelled due to shutdown", taskIndex, batch.ID)
+				resultChan <- TaskExecutionResult{
+					Index:  taskIndex,
+					TaskID: fmt.Sprintf("%s_%d", batch.ID, taskIndex),
+					Status: "cancelled",
+					Error:  "shutdown requested",
+				}
+				return
+			default:
+			}
+
+			// 计算该任务的精确执行时间
+			scheduledTime := startTime.Add(time.Duration(taskIndex) * interval)
+
+			// 精确等待到执行时间
+			now := time.Now()
+			if scheduledTime.After(now) {
+				waitTime := scheduledTime.Sub(now)
+				if waitTime > 0 {
+					// 使用定时器而不是sleep，确保精确性
+					timer := time.NewTimer(waitTime)
+					select {
+					case <-timer.C:
+						// 到达执行时间
+					case <-btm.done:
+						timer.Stop()
+						btm.logger.Infof("Task %d in batch %s cancelled during wait", taskIndex, batch.ID)
+						resultChan <- TaskExecutionResult{
+							Index:  taskIndex,
+							TaskID: fmt.Sprintf("%s_%d", batch.ID, taskIndex),
+							Status: "cancelled",
+							Error:  "shutdown requested during wait",
+						}
+						return
+					}
+				}
+			}
+
+			// 记录实际执行时间，计算误差
+			actualTime := time.Now()
+			timeError := actualTime.Sub(scheduledTime)
+			if timeError < 0 {
+				timeError = -timeError
+			}
+
+			// 检查时间误差是否超过阈值
+			if timeError > btm.config.MaxTimeError {
+				btm.logger.Warnf("Task %d in batch %s executed with time error: %v (threshold: %v)",
+					taskIndex, batch.ID, timeError, btm.config.MaxTimeError)
+			}
+
+			// 执行任务（在独立的goroutine中）
+			result := btm.executeTask(taskToExecute, batch, taskIndex, scheduledTime, actualTime)
+			result.TimeError = timeError
+
+			btm.logger.Debugf("Completed task %d in batch %s (time error: %v, duration: %v)",
+				taskIndex, batch.ID, timeError, result.Duration)
+
+			// 发送结果到通道
+			resultChan <- result
+
+		}(i, task)
+	}
+
+	// 等待所有任务完成
+	go func() {
+		taskWg.Wait()
+		close(resultChan)
+	}()
+
+	// 收集所有任务结果
+	completedTasks := 0
+	failedTasks := 0
 	var totalTimeError time.Duration
 	maxTimeError := time.Duration(0)
 
-	for i, task := range batch.Tasks {
-		// 检查是否应该停止
-		select {
-		case <-btm.done:
-			btm.logger.Infof("Batch %s execution stopped due to shutdown", batch.ID)
-			batch.Status = "cancelled"
-			batch.UpdatedAt = time.Now().UnixNano()
-			btm.updateBatchStatus(context.Background(), batch)
-			return
-		default:
+	for result := range resultChan {
+		// 存储结果
+		btm.mu.Lock()
+		if execution, exists := btm.executions[batch.ID]; exists {
+			execution.TaskResults[result.Index] = result
+			execution.TimeErrors[result.Index] = result.TimeError
+			execution.CurrentIndex = completedTasks + 1
 		}
+		btm.mu.Unlock()
 
-		// 计算精确执行时间
-		scheduledTime := startTime.Add(time.Duration(i) * interval)
-
-		// 精确等待到执行时间
-		now := time.Now()
-		if scheduledTime.After(now) {
-			waitTime := scheduledTime.Sub(now)
-			if waitTime > 0 {
-				time.Sleep(waitTime)
-			}
+		completedTasks++
+		totalTimeError += result.TimeError
+		if result.TimeError > maxTimeError {
+			maxTimeError = result.TimeError
 		}
-
-		// 记录实际执行时间，计算误差
-		actualTime := time.Now()
-		timeError := actualTime.Sub(scheduledTime)
-		if timeError < 0 {
-			timeError = -timeError
-		}
-
-		execution.TimeErrors = append(execution.TimeErrors, timeError)
-		totalTimeError += timeError
-		if timeError > maxTimeError {
-			maxTimeError = timeError
-		}
-
-		// 检查时间误差是否超过阈值
-		if timeError > btm.config.MaxTimeError {
-			btm.logger.Warnf("Task %d in batch %s executed with time error: %v (threshold: %v)",
-				i, batch.ID, timeError, btm.config.MaxTimeError)
-		}
-
-		// 执行任务
-		result := btm.executeTask(task, batch, i, scheduledTime, actualTime)
-		execution.TaskResults[i] = result
-		execution.CurrentIndex = i + 1
-		execution.LastTaskTime = actualTime
 
 		if result.Status == "failed" {
-			btm.logger.Errorf("Task %d in batch %s failed: %v", i, batch.ID, result.Error)
-
-			// 根据配置决定是否继续执行
-			if !btm.config.RetryOnFailure {
-				batch.Status = "failed"
-				batch.ErrorMsg = result.Error
-				batch.UpdatedAt = time.Now().UnixNano()
-				btm.updateBatchStatus(context.Background(), batch)
-
-				// 更新指标
-				btm.metrics.mu.Lock()
-				btm.metrics.FailedBatches++
-				btm.metrics.mu.Unlock()
-
-				// 清理执行状态
-				btm.mu.Lock()
-				delete(btm.executions, batch.ID)
-				btm.mu.Unlock()
-
-				return
-			}
+			failedTasks++
+			btm.logger.Errorf("Task %d in batch %s failed: %v", result.Index, batch.ID, result.Error)
 		}
+	}
 
-		btm.logger.Debugf("Completed task %d in batch %s (time error: %v)", i, batch.ID, timeError)
+	// 检查批量任务是否应该标记为失败
+	if failedTasks > 0 && !btm.config.RetryOnFailure {
+		batch.Status = "failed"
+		batch.ErrorMsg = fmt.Sprintf("%d tasks failed", failedTasks)
+		batch.UpdatedAt = time.Now().UnixNano()
+		btm.updateBatchStatus(context.Background(), batch)
+
+		// 更新指标
+		btm.metrics.mu.Lock()
+		btm.metrics.FailedBatches++
+		btm.metrics.mu.Unlock()
+
+		// 清理执行状态
+		btm.mu.Lock()
+		delete(btm.executions, batch.ID)
+		btm.mu.Unlock()
+
+		btm.logger.Errorf("Batch %s failed with %d failed tasks", batch.ID, failedTasks)
+		return
 	}
 
 	// 所有任务执行完成
@@ -356,7 +409,11 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 	btm.updateBatchStatus(context.Background(), batch)
 
 	// 更新指标
-	avgTimeError := totalTimeError / time.Duration(len(batch.Tasks))
+	avgTimeError := time.Duration(0)
+	if completedTasks > 0 {
+		avgTimeError = totalTimeError / time.Duration(completedTasks)
+	}
+
 	btm.metrics.mu.Lock()
 	btm.metrics.CompletedBatches++
 	btm.metrics.AvgTimeError = avgTimeError
@@ -370,8 +427,8 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 	delete(btm.executions, batch.ID)
 	btm.mu.Unlock()
 
-	btm.logger.Infof("Completed batch %s with %d tasks (avg time error: %v, max time error: %v)",
-		batch.ID, len(batch.Tasks), avgTimeError, maxTimeError)
+	btm.logger.Infof("Completed batch %s with %d tasks (%d succeeded, %d failed, avg time error: %v, max time error: %v)",
+		batch.ID, len(batch.Tasks), completedTasks-failedTasks, failedTasks, avgTimeError, maxTimeError)
 }
 
 // executeTask 执行单个任务
