@@ -180,20 +180,24 @@ func (btm *BatchTaskManager) ScheduleBatch(ctx context.Context, tasks []*Task, i
 
 	// 计算第一个任务的执行时间
 	firstTaskTime := startAt
-	if firstTaskTime.Before(time.Now()) {
-		firstTaskTime = time.Now().Add(100 * time.Millisecond)
+	now := time.Now()
+
+	// 如果开始时间过早，需要自动调整
+	// 确保有足够的时间来准备和调度所有任务
+	minStartTime := now.Add(200 * time.Millisecond) // 至少200ms的准备时间
+	if firstTaskTime.Before(minStartTime) {
+		btm.logger.Warnf("Start time %v is too early, adjusting to %v",
+			firstTaskTime.Format("15:04:05.000"), minStartTime.Format("15:04:05.000"))
+		firstTaskTime = minStartTime
 		batch.StartTime = firstTaskTime.UnixNano()
 		btm.updateBatchStatus(ctx, batch)
 	}
 
-	// 创建定时器
-	timer := time.AfterFunc(time.Until(firstTaskTime), func() {
-		btm.executeBatch(batch)
-	})
+	// 直接启动批量任务执行，不等待startTime
+	// 每个任务的goroutine会独立等待到自己的执行时间
+	go btm.executeBatch(batch)
 
-	btm.mu.Lock()
-	btm.timers[batchID] = timer
-	btm.mu.Unlock()
+	// 注意：不再使用timer，因为每个任务都会独立等待
 
 	// 更新指标
 	btm.metrics.mu.Lock()
@@ -243,10 +247,7 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 	btm.wg.Add(1)
 	defer btm.wg.Done()
 
-	// 清理定时器
-	btm.mu.Lock()
-	delete(btm.timers, batch.ID)
-	btm.mu.Unlock()
+	// 注意：不再需要清理定时器，因为我们不使用全局timer了
 
 	// 创建执行状态
 	execution := &BatchTaskExecution{
@@ -265,10 +266,11 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 	batch.UpdatedAt = time.Now().UnixNano()
 	btm.updateBatchStatus(context.Background(), batch)
 
-	btm.logger.Infof("Starting concurrent execution of batch %s with %d tasks", batch.ID, len(batch.Tasks))
-
 	startTime := time.Unix(0, batch.StartTime)
 	interval := time.Duration(batch.Interval)
+
+	btm.logger.Infof("Starting concurrent execution of batch %s with %d tasks, startTime: %v, interval: %v",
+		batch.ID, len(batch.Tasks), startTime.Format("15:04:05.000"), interval)
 
 	// 创建结果收集通道和同步机制
 	resultChan := make(chan TaskExecutionResult, len(batch.Tasks))
@@ -301,12 +303,16 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 			now := time.Now()
 			if scheduledTime.After(now) {
 				waitTime := scheduledTime.Sub(now)
+				btm.logger.Debugf("Task %d in batch %s scheduled at %v, waiting %v",
+					taskIndex, batch.ID, scheduledTime.Format("15:04:05.000"), waitTime)
+
 				if waitTime > 0 {
 					// 使用定时器而不是sleep，确保精确性
 					timer := time.NewTimer(waitTime)
 					select {
 					case <-timer.C:
 						// 到达执行时间
+						btm.logger.Debugf("Task %d in batch %s timer triggered", taskIndex, batch.ID)
 					case <-btm.done:
 						timer.Stop()
 						btm.logger.Infof("Task %d in batch %s cancelled during wait", taskIndex, batch.ID)
@@ -319,6 +325,11 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 						return
 					}
 				}
+			} else {
+				// 预定时间已过，立即执行
+				pastDue := now.Sub(scheduledTime)
+				btm.logger.Warnf("Task %d in batch %s scheduled time %v has passed by %v, executing immediately",
+					taskIndex, batch.ID, scheduledTime.Format("15:04:05.000"), pastDue)
 			}
 
 			// 记录实际执行时间，计算误差
@@ -494,11 +505,7 @@ func (btm *BatchTaskManager) executeTask(task *Task, batch *BatchTask, taskIndex
 // CancelBatch 取消批量任务
 func (btm *BatchTaskManager) CancelBatch(batchID string) error {
 	btm.mu.Lock()
-	timer, exists := btm.timers[batchID]
-	if exists {
-		timer.Stop()
-		delete(btm.timers, batchID)
-	}
+	// 不再需要处理timer，直接删除执行状态
 	delete(btm.executions, batchID)
 	btm.mu.Unlock()
 
@@ -583,14 +590,7 @@ func (btm *BatchTaskManager) Shutdown() {
 	// 停止接受新任务
 	close(btm.done)
 
-	// 取消所有定时器
-	btm.mu.Lock()
-	for batchID, timer := range btm.timers {
-		timer.Stop()
-		btm.logger.Infof("Cancelled pending batch %s", batchID)
-	}
-	btm.timers = make(map[string]*time.Timer)
-	btm.mu.Unlock()
+	// 不再需要取消定时器，因为每个任务都会通过btm.done通道接收关闭信号
 
 	// 等待所有正在执行的任务完成（最多等待30秒）
 	done := make(chan struct{})
