@@ -31,7 +31,7 @@ func (btm *BatchTaskManager) storeBatch(ctx context.Context, batch *BatchTask) e
 	key := batchKeyPrefix + batch.ID
 
 	// 使用事务确保原子性
-	pipe := btm.redis.TxPipeline()
+	pipe := btm.redis.Pipeline()
 
 	// 存储批量任务数据
 	pipe.Set(ctx, key, data, btm.config.BatchTTL)

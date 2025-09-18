@@ -180,18 +180,6 @@ func (btm *BatchTaskManager) ScheduleBatch(ctx context.Context, tasks []*Task, i
 
 	// 计算第一个任务的执行时间
 	firstTaskTime := startAt
-	now := time.Now()
-
-	// 如果开始时间过早，需要自动调整
-	// 确保有足够的时间来准备和调度所有任务
-	minStartTime := now.Add(800 * time.Millisecond) // 至少200ms的准备时间
-	if firstTaskTime.Before(minStartTime) {
-		btm.logger.Warnf("Start time %v is too early, adjusting to %v",
-			firstTaskTime.Format("15:04:05.000"), minStartTime.Format("15:04:05.000"))
-		firstTaskTime = minStartTime
-		batch.StartTime = firstTaskTime.UnixNano()
-		btm.updateBatchStatus(ctx, batch)
-	}
 
 	// 直接启动批量任务执行，不等待startTime
 	// 每个任务的goroutine会独立等待到自己的执行时间
@@ -247,8 +235,6 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 	btm.wg.Add(1)
 	defer btm.wg.Done()
 
-	// 注意：不再需要清理定时器，因为我们不使用全局timer了
-
 	// 创建执行状态
 	execution := &BatchTaskExecution{
 		BatchID:     batch.ID,
@@ -266,7 +252,7 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 	batch.UpdatedAt = time.Now().UnixNano()
 	btm.updateBatchStatus(context.Background(), batch)
 
-	startTime := time.Unix(0, batch.StartTime)
+	startTime := time.Now()
 	interval := time.Duration(batch.Interval)
 
 	btm.logger.Infof("Starting concurrent execution of batch %s with %d tasks, startTime: %v, interval: %v",
@@ -295,7 +281,6 @@ func (btm *BatchTaskManager) executeBatch(batch *BatchTask) {
 				return
 			default:
 			}
-
 			// 计算该任务的精确执行时间
 			scheduledTime := startTime.Add(time.Duration(taskIndex) * interval)
 
